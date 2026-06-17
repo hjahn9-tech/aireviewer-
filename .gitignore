@@ -1,0 +1,31 @@
+# 환경변수 (절대 커밋 금지)
+.env
+.env.local
+.env.production
+
+# Node modules
+node_modules/
+.npm/
+
+# Build output
+dist/
+build/
+.vercel/
+
+# OS 파일
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 로그
+*.log
+npm-debug.log*
+
+# 캐시
+.eslintcache
+.tsbuildinfo
