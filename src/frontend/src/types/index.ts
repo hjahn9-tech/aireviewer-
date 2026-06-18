@@ -41,6 +41,9 @@ export interface EvaluationResult {
   dropout_risk_scenes: DropoutScene[]
   doppelganger_recommendations: string[]
   data_sources?: string[]
+  detected_format?: string
+  detected_format_label?: string
+  weighted_score?: number
   _mock?: boolean
 }
 

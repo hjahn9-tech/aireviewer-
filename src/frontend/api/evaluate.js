@@ -1,502 +1,417 @@
 /**
- * CREX AI Reviewer — 페르소나 평가 엔진
+ * CREX AI Reviewer — 평가 엔진 v3.0
  *
- * 페르소나 근거 자료:
- * [1] KCA 미디어이슈&트렌드 vol.61 (2023) — SVOD 장르별 이용시간 비중
- *     드라마&로맨스 19.4% / 범죄&스릴러 13.8% / SF&판타지 12.6% / 코미디 8.7%
- * [2] KISDI Perspectives (2021) — 성별 드라마 시청비율
- *     여성 33.9% vs 남성 20.4%; 남성 스포츠/뉴스 우세
- * [3] KOFIC KoBiz Gen Z 리포트 (2025) — 극장 관람률 20대 83.9%, 10대 83.2%
- *     20대 애니 비중 40%(데몬슬레이어), 여성 관람객 64%(로맨스 애니)
- * [4] KOCCA 2024 드라마 트렌드 리포트 — 여성 서사 확대, 워맨스 코드,
- *     도덕적 회색지대, Z세대 복합 문화 기호 수용
- * [5] 한국갤럽 (2024.3~4) — 전국 13세 이상 1,777명 드라마/영화 선호 조사
- *     10~30대: 최신작, 40~50대: 고전 선호
- * [6] KCA (2023) — 연령별 1위 콘텐츠
- *     10~20대: 더글로리(범죄/스릴러), 30~40대: 나는Solo(버라이어티), 50대+: 더글로리+버라이어티
+ * 점수 계산 파이프라인 (CLAUDE.md §5-3):
+ * 1. analyzeScenario  → 포맷 감지 + 장르/서사/감정 피처 추출
+ * 2. anti_tags 감점  → 페르소나 비선호 요소 감지 시 A 차원 감점
+ * 3. scorePersona    → per-persona evaluation_weights 반영
+ * 4. format_sensitivity 보정 → 포맷 친숙도로 점수 압축/증폭
+ * 5. FORMAT_DIM_WEIGHTS → 포맷별 차원 가중 평균으로 종합 등급
  */
 
-// ─── 페르소나 20명 (근거 자료 태그 포함) ──────────────────────────────────────
-const PERSONAS = [
-  // ── 드라마&로맨스 코어 (19.4% / SVOD 2위 장르 [1]) ──
-  {
-    id:'p01', name:'김지연', age:28, gender:'여성', occupation:'마케터', region:'서울',
-    taste_community:'로맨틱 드라마 & 감성 힐링',
-    engagement_type:'정주행형',
-    genre_tags:['로맨스','힐링','직장물'],
-    // 여성 드라마 시청비율 33.9% [2], 30대 이하 여성 로맨스 코어 시청층
-    genre_weights:{ romance:9, healing:8, thriller:4, horror:2, sf:3, historical:5, social:5, youth:6, action:3 },
-    narrative_pref:'linear', frbr:['character','emotion'], niche_index:0.3,
-    data_basis:'KISDI(2021) 여성 드라마 33.9% / KCA(2023) 드라마&로맨스 19.4%',
-  },
-  {
-    id:'p02', name:'오미란', age:52, gender:'여성', occupation:'주부', region:'전주',
-    taste_community:'가족 드라마 & 감동 멜로',
-    engagement_type:'정주행형',
-    genre_tags:['가족','멜로','힐링'],
-    // 한국갤럽(2024) 40~50대 고전 드라마 선호 [5], KCA 50대+ 버라이어티 1위
-    genre_weights:{ romance:7, healing:9, thriller:3, horror:1, sf:2, historical:7, social:6, youth:3, action:2 },
-    narrative_pref:'linear', frbr:['character','emotion'], niche_index:0.2,
-    data_basis:'한국갤럽(2024) 40~50대 고전선호 / KISDI(2021) 여성 드라마 33.9%',
-  },
-  {
-    id:'p03', name:'장나래', age:32, gender:'여성', occupation:'스타트업 대표', region:'서울',
-    taste_community:'여성 서사 & 성장 드라마',
-    engagement_type:'정주행형',
-    genre_tags:['성장','커리어','워맨스'],
-    // KOCCA(2024) 여성 서사 전면 확대, 워맨스 코드 부상 [4]
-    genre_weights:{ romance:6, healing:6, thriller:6, horror:2, sf:5, historical:4, social:7, youth:5, action:4 },
-    narrative_pref:'linear', frbr:['character','event'], niche_index:0.45,
-    data_basis:'KOCCA(2024) 여성서사 확대·워맨스 트렌드 [4]',
-  },
+import { PERSONAS, FORMAT_SIGNALS, FORMAT_DIM_WEIGHTS } from '../src/data/personas.js'
 
-  // ── 범죄&스릴러 코어 (13.8% / SVOD 3위 [1]) ──
-  {
-    id:'p04', name:'박수진', age:22, gender:'여성', occupation:'대학생', region:'서울',
-    taste_community:'범죄 스릴러 & 다크 드라마',
-    engagement_type:'클립형',
-    genre_tags:['스릴러','범죄','다크'],
-    // KCA(2023) 10~20대 1위 콘텐츠 '더글로리'(범죄/스릴러) [6]
-    genre_weights:{ romance:5, healing:4, thriller:9, horror:7, sf:5, historical:3, social:7, youth:6, action:5 },
-    narrative_pref:'nonlinear', frbr:['character','event'], niche_index:0.6,
-    data_basis:'KCA(2023) 10~20대 더글로리(범죄스릴러) 1위 [6]',
-  },
-  {
-    id:'p05', name:'박철민', age:44, gender:'남성', occupation:'경찰관', region:'부산',
-    taste_community:'범죄 수사물 & 액션 스릴러',
-    engagement_type:'완주형',
-    genre_tags:['범죄','수사','액션'],
-    // KCA(2023) 50대+ 더글로리 선호 [6], 남성 드라마 20.4% [2]
-    genre_weights:{ romance:3, healing:3, thriller:10, horror:4, sf:4, historical:5, social:6, youth:2, action:9 },
-    narrative_pref:'linear', frbr:['event','character'], niche_index:0.5,
-    data_basis:'KCA(2023) 50대+ 범죄스릴러 선호 / KISDI(2021) 남성 드라마 20.4% [2][6]',
-  },
-  {
-    id:'p06', name:'신예은', age:19, gender:'여성', occupation:'고등학생', region:'수원',
-    taste_community:'공포 & 오컬트 팬',
-    engagement_type:'클립형',
-    genre_tags:['호러','오컬트','스릴러'],
-    // KCA(2023) 10~20대 범죄스릴러 1위 [6], 10대 극장 관람률 83.2% [3]
-    genre_weights:{ romance:5, healing:3, thriller:7, horror:10, sf:5, historical:3, social:3, youth:7, action:5 },
-    narrative_pref:'nonlinear', frbr:['event','emotion'], niche_index:0.75,
-    data_basis:'KCA(2023) 10~20대 더글로리 1위 / KOFIC(2025) 10대 극장관람 83.2% [3][6]',
-  },
+// ─── Anti-tag 키워드 감지기 ───────────────────────────────────────────────────
+const ANTI_TAG_DETECTORS = {
+  '하드코어 폭력':          t => /고어|잔인한|학살|고문|처형|끔찍한/.test(t),
+  '과도한 폭력':            t => /잔인|폭력적|고어|학살/.test(t),
+  'SF 세계관 설명 과다':    t => /설정 설명|세계관 소개|시스템 설명|설정집/.test(t),
+  '혐오·비하 소재':         t => /혐오|비하|차별|폄훼/.test(t),
+  '혐오·차별 묘사':         t => /혐오|차별|비하/.test(t),
+  '팬서비스 과다':          t => /팬서비스|케미/.test(t),
+  '아이돌 출연 중심':       t => /아이돌|k팝|가수 출신/.test(t),
+  '클리셰 해피엔딩':        t => /해피엔딩|행복하게 끝|둘이 함께/.test(t),
+  '공식 클리셰':            t => /재벌|오해 해소|신데렐라|기억상실/.test(t),
+  '재벌 판타지':            t => /재벌|오너|회장|재벌가/.test(t),
+  '비현실적 재벌 신데렐라': t => /재벌|신데렐라|오너/.test(t),
+  '로맨스 과다 비중':       t => (t.match(/사랑|연애|로맨스|연인/g) || []).length >= 4,
+  '로맨스 강제 삽입':       t => /사랑|연애|로맨스/.test(t),
+  '로맨스 과잉 삽입':       t => (t.match(/사랑|연애|로맨스/g) || []).length >= 3,
+  '우울한 결말':            t => /비극|슬픈 결말|비운의|죽음으로 끝/.test(t),
+  '절망적 엔딩':            t => /절망|희망 없|비극적/.test(t),
+  '가족 붕괴 결말':         t => /가족 해체|이혼|가족이 죽|이산가족/.test(t),
+  '해피엔딩 강요':          t => /해피엔딩|행복하게/.test(t),
+  '느린 전개':              t => /잔잔한|천천히|소소한/.test(t),
+  '비현실적 신체 능력':     t => /초인적|초능력|불가능한 신체/.test(t),
+  '역사 왜곡':              t => /역사 왜곡|사실 왜곡/.test(t),
+  '현대적 재해석 과잉':     t => /트렌디한 사극|현대적 사극/.test(t),
+  '클리셰 악당':            t => /전형적인 악당|클리셰 빌런/.test(t),
+  '급전개 해피엔딩':        t => /갑자기 해결|급전개/.test(t),
+  '19금 내용':              t => /성인|19금|선정적|베드씬/.test(t),
+  '강제 이성애 중심화':     t => /남녀 관계|이성 커플/.test(t),
+  '클리셰 삼각관계 남용':   t => /삼각관계/.test(t),
+  '기성세대 시각 강요':     t => /꼰대|기성세대/.test(t),
+  '노력 무의미 결말':       t => /아무리 해도|결국 실패/.test(t),
+  '편성 불가 소재':         t => /19금|선정|반사회/.test(t),
+  '광고주 기피 요소':       t => /음주 조장|도박/.test(t),
+  '시청률 저하 요소':       t => /지나치게 난해한/.test(t),
+}
 
-  // ── SF&판타지 코어 (12.6% / SVOD 4위 [1]) ──
-  {
-    id:'p07', name:'강동현', age:33, gender:'남성', occupation:'IT 개발자', region:'경기',
-    taste_community:'SF & 기술 철학 드라마',
-    engagement_type:'완주형',
-    genre_tags:['SF','스릴러','미스터리'],
-    // SF&판타지 12.6% [1], 남성 드라마 20.4% but 장르물 강세 [2]
-    genre_weights:{ romance:4, healing:4, thriller:7, horror:4, sf:10, historical:3, social:7, youth:3, action:6 },
-    narrative_pref:'nonlinear', frbr:['concept','event'], niche_index:0.75,
-    data_basis:'KCA(2023) SF&판타지 12.6% 4위 [1]',
-  },
-  {
-    id:'p08', name:'최현우', age:47, gender:'남성', occupation:'자영업', region:'인천',
-    taste_community:'SF/테크 스릴러 & 장르 마니아',
-    engagement_type:'완주형',
-    genre_tags:['SF','범죄','스릴러'],
-    // KISDI(2021) 40대 남성 드라마 20.4% [2], 장르물 하드코어 팬층
-    genre_weights:{ romance:3, healing:3, thriller:9, horror:6, sf:9, historical:5, social:6, youth:2, action:8 },
-    narrative_pref:'nonlinear', frbr:['event','concept'], niche_index:0.7,
-    data_basis:'KISDI(2021) 남성 드라마 20.4% / SF장르 마니아층 [1][2]',
-  },
-  {
-    id:'p09', name:'홍기태', age:23, gender:'남성', occupation:'게임 유튜버', region:'경기',
-    taste_community:'게임·판타지 & 애니 원작물',
-    engagement_type:'클립형',
-    genre_tags:['판타지','액션','애니원작'],
-    // KOFIC(2025) 20대 애니 관람 40%(데몬슬레이어) [3]
-    genre_weights:{ romance:4, healing:4, thriller:6, horror:5, sf:7, historical:3, social:3, youth:8, action:9 },
-    narrative_pref:'episodic', frbr:['event','character'], niche_index:0.8,
-    data_basis:'KOFIC(2025) 20대 애니 40% 점유(데몬슬레이어) [3]',
-  },
+function calcAntiTagPenalty(persona, analysis) {
+  const t = analysis.text_lower
+  const hitCount = persona.taste_ontology.anti_tags.filter(tag => {
+    const fn = ANTI_TAG_DETECTORS[tag]
+    return fn ? fn(t) : false
+  }).length
+  return Math.min(4, hitCount * 1.5)
+}
 
-  // ── 버라이어티&리얼리티 코어 (26.7% / SVOD 1위 [1]) ──
-  {
-    id:'p10', name:'이수진', age:36, gender:'여성', occupation:'초등교사', region:'대전',
-    taste_community:'리얼리티 & 관찰 예능 팬',
-    engagement_type:'정주행형',
-    genre_tags:['힐링','가족','현실'],
-    // KCA(2023) 30~40대 나는Solo(버라이어티) 1위 [6]
-    genre_weights:{ romance:7, healing:9, thriller:3, horror:1, sf:2, historical:5, social:5, youth:4, action:2 },
-    narrative_pref:'episodic', frbr:['character','emotion'], niche_index:0.25,
-    data_basis:'KCA(2023) 30~40대 리얼리티 버라이어티 1위 [6]',
-  },
-  {
-    id:'p11', name:'조성훈', age:38, gender:'남성', occupation:'광고 PD', region:'서울',
-    taste_community:'웰메이드 상업 드라마',
-    engagement_type:'완주형',
-    genre_tags:['웰메이드','감동','상업'],
-    // 한국갤럽(2024) 30~40대 최신 드라마 선호 [5], 제작 완성도 중시
-    genre_weights:{ romance:6, healing:7, thriller:6, horror:2, sf:5, historical:6, social:6, youth:5, action:5 },
-    narrative_pref:'linear', frbr:['event','character'], niche_index:0.35,
-    data_basis:'한국갤럽(2024) 30~40대 최신작 선호 [5]',
-  },
+// ─── 장르 키워드 ──────────────────────────────────────────────────────────────
+const GENRE_KW = {
+  romance:   ['사랑','연인','로맨스','연애','키스','고백','설렘','짝사랑','남자친구','여자친구','이별','재회','연정','두근','감정선'],
+  healing:   ['힐링','따뜻','위로','치유','가족','소소','일상','평화','잔잔','온기','감동','포근'],
+  thriller:  ['살인','범죄','추리','스릴러','사건','경찰','수사','긴장','추격','공범','음모','배신','반전','비밀','조작','증거'],
+  horror:    ['귀신','공포','오컬트','호러','저주','유령','악령','신내림','흉가','괴물','초자연'],
+  sf:        ['우주','인공지능','로봇','미래','SF','시간여행','기술','사이버','외계','차원','복제','디스토피아','이세계','능력자','판타지','마법','이능'],
+  historical:['조선','고려','역사','사극','궁중','왕','왕비','임금','한복','선비','시대극','근대','일제','무신'],
+  social:    ['사회','계층','빈곤','차별','정치','부패','노동','불평등','시위','갑질','비판','체제','현실 고발'],
+  youth:     ['청춘','대학교','고등학교','성장','졸업','입시','동아리','첫사랑','교복','취업준비','청년','20대','10대'],
+  action:    ['액션','격투','전투','폭발','무기','군인','싸움','총','칼','암살','전쟁','저격'],
+}
 
-  // ── 사극/역사물 (40~50대+ 선호) ──
-  {
-    id:'p12', name:'임종수', age:61, gender:'남성', occupation:'은퇴 공무원', region:'광주',
-    taste_community:'정통 사극 & 역사물',
-    engagement_type:'완주형',
-    genre_tags:['사극','역사','정치'],
-    // 한국갤럽(2024) 40~50대 고전 선호 [5], KCA 50대+ 역사 사극 수요
-    genre_weights:{ romance:4, healing:5, thriller:5, horror:2, sf:2, historical:10, social:7, youth:2, action:5 },
-    narrative_pref:'linear', frbr:['context','concept'], niche_index:0.5,
-    data_basis:'한국갤럽(2024) 40~50대 고전선호 [5]',
-  },
-  {
-    id:'p13', name:'권민석', age:55, gender:'남성', occupation:'대학교수', region:'대구',
-    taste_community:'휴머니즘 & 사회비평 드라마',
-    engagement_type:'완주형',
-    genre_tags:['휴머니즘','사회','역사'],
-    // KOCCA(2024) 도덕적 회색지대 탐구 트렌드 [4], 고연령 지식층
-    genre_weights:{ romance:4, healing:6, thriller:5, horror:2, sf:6, historical:8, social:9, youth:3, action:2 },
-    narrative_pref:'nonlinear', frbr:['concept','context'], niche_index:0.65,
-    data_basis:'KOCCA(2024) 도덕적 회색지대 트렌드 / 한국갤럽 40~50대 [4][5]',
-  },
+const GENRE_KO = {
+  romance:'로맨스', healing:'힐링', thriller:'범죄·스릴러', horror:'공포·오컬트',
+  sf:'SF·판타지', historical:'사극·역사', social:'사회비평', youth:'청춘물', action:'액션',
+}
 
-  // ── 청춘/Z세대 ──
-  {
-    id:'p14', name:'정은서', age:17, gender:'여성', occupation:'고등학생', region:'대구',
-    taste_community:'웹툰 원작 & Z세대 청춘',
-    engagement_type:'클립형',
-    genre_tags:['청춘','판타지','웹툰원작'],
-    // KOFIC(2025) 10대 극장관람 83.2% [3], KOCCA(2024) Z세대 복합 문화 기호 수용 [4]
-    genre_weights:{ romance:7, healing:5, thriller:4, horror:5, sf:6, historical:3, social:3, youth:10, action:5 },
-    narrative_pref:'episodic', frbr:['character','emotion'], niche_index:0.8,
-    data_basis:'KOFIC(2025) 10대 극장관람 83.2% / KOCCA(2024) Z세대 복합기호 [3][4]',
-  },
-  {
-    id:'p15', name:'이수아', age:16, gender:'여성', occupation:'중학생', region:'제주',
-    taste_community:'K-드라마 팬덤 & 아이돌 컬처',
-    engagement_type:'클립형',
-    genre_tags:['청춘','로맨스','팬덤'],
-    // KCA(2023) 10~20대 범죄스릴러+로맨스 혼용 [6], 팬덤 중심 소비
-    genre_weights:{ romance:9, healing:6, thriller:4, horror:3, sf:4, historical:3, social:3, youth:9, action:3 },
-    narrative_pref:'episodic', frbr:['character','emotion'], niche_index:0.4,
-    data_basis:'KCA(2023) 10~20대 선호 콘텐츠 패턴 [6]',
-  },
+const FORMAT_KO = {
+  movie:'영화', legacy_drama:'방송 드라마', ott_drama:'OTT 드라마',
+  short_form:'숏폼', webtoon:'웹툰', web_novel:'웹소설', game:'게임',
+}
 
-  // ── 사회비평/인디 ──
-  {
-    id:'p16', name:'윤재호', age:26, gender:'남성', occupation:'대학원생', region:'서울',
-    taste_community:'아트하우스 & 사회비평 독립영화',
-    engagement_type:'완주형',
-    genre_tags:['독립','사회비평','실험적'],
-    // KOCCA(2024) 도덕적 회색지대 트렌드, Z세대 복합 기호 [4]
-    genre_weights:{ romance:5, healing:5, thriller:7, horror:6, sf:6, historical:6, social:10, youth:6, action:3 },
-    narrative_pref:'nonlinear', frbr:['concept','context'], niche_index:0.9,
-    data_basis:'KOCCA(2024) 도덕적 회색지대 / Z세대 복합 문화 기호 [4]',
-  },
-  {
-    id:'p17', name:'문혜진', age:29, gender:'여성', occupation:'작가 지망생', region:'서울',
-    taste_community:'문학적 감성 드라마 & 독립영화',
-    engagement_type:'완주형',
-    genre_tags:['문학적','감성','독립'],
-    // KOCCA(2024) 여성 서사 확대, 30대 여성 최신작 선호 [4][5]
-    genre_weights:{ romance:6, healing:7, thriller:6, horror:5, sf:5, historical:6, social:8, youth:5, action:2 },
-    narrative_pref:'nonlinear', frbr:['concept','emotion'], niche_index:0.8,
-    data_basis:'KOCCA(2024) 여성서사 확대 / 한국갤럽 30대 최신작 [4][5]',
-  },
-
-  // ── 직업/의학 드라마 ──
-  {
-    id:'p18', name:'한소희', age:31, gender:'여성', occupation:'간호사', region:'대전',
-    taste_community:'의학·직업 드라마 & 현실 반영',
-    engagement_type:'정주행형',
-    genre_tags:['직업물','의학','현실'],
-    // KISDI(2021) 여성 드라마 33.9% [2], 직업 고증 민감 시청층
-    genre_weights:{ romance:6, healing:7, thriller:5, horror:3, sf:4, historical:4, social:7, youth:4, action:4 },
-    narrative_pref:'linear', frbr:['character','event'], niche_index:0.4,
-    data_basis:'KISDI(2021) 여성 드라마 33.9% / 직업 고증 민감층 [2]',
-  },
-
-  // ── 경제/정치 스릴러 ──
-  {
-    id:'p19', name:'황성진', age:42, gender:'남성', occupation:'증권 애널리스트', region:'서울',
-    taste_community:'경제·정치 스릴러',
-    engagement_type:'완주형',
-    genre_tags:['정치','경제','스릴러'],
-    // KCA(2023) 범죄&스릴러 13.8% [1], 40대 남성 사회비평 수요
-    genre_weights:{ romance:3, healing:3, thriller:8, horror:2, sf:6, historical:5, social:8, youth:2, action:5 },
-    narrative_pref:'nonlinear', frbr:['concept','event'], niche_index:0.65,
-    data_basis:'KCA(2023) 범죄스릴러 13.8% [1]',
-  },
-
-  // ── 코미디/버라이어티 경계 (코미디 8.7% [1]) ──
-  {
-    id:'p20', name:'류지아', age:24, gender:'여성', occupation:'뷰티 유튜버', region:'서울',
-    taste_community:'트렌디 로맨스 & 숏폼 코미디',
-    engagement_type:'클립형',
-    genre_tags:['로맨스','코미디','트렌디'],
-    // KCA(2023) 코미디 8.7% [1], 20대 여성 트렌드 소비층
-    genre_weights:{ romance:9, healing:6, thriller:4, horror:2, sf:3, historical:3, social:4, youth:8, action:3 },
-    narrative_pref:'episodic', frbr:['character','emotion'], niche_index:0.45,
-    data_basis:'KCA(2023) 코미디 8.7% / 20대 여성 OTT 트렌드 소비 [1]',
-  },
-]
-
-// ─── 시나리오 분석 엔진 ───────────────────────────────────────────────────────
+// ─── 시나리오 피처 추출 ───────────────────────────────────────────────────────
 function analyzeScenario(text) {
   const t = text.toLowerCase()
 
-  const genreSignals = {
-    romance: ['사랑','연인','로맨스','연애','키스','고백','설렘','짝사랑','남자친구','여자친구','데이트','이별','재회','감정','두근','연정'],
-    healing: ['힐링','따뜻','위로','치유','가족','소소','일상','평화','회복','위안','따스','잔잔','온기'],
-    thriller: ['살인','범죄','추리','스릴러','사건','경찰','수사','긴장','추격','공범','음모','배신','반전','비밀','조작','증거'],
-    horror: ['귀신','공포','오컬트','무서','호러','저주','유령','악령','신내림','흉가','괴물','공포감'],
-    sf: ['우주','인공지능','로봇','미래','sf','시간여행','기술','사이버','외계','차원','과학','복제','디스토피아','포스트아포칼립스'],
-    historical: ['조선','고려','역사','사극','궁중','전통','고대','왕','왕비','임금','한복','선비','과거','시대','근대','일제'],
-    social: ['사회','계층','빈곤','차별','정치','부패','노동','현실','불평등','시위','갑질','비판','모순','구조','체제'],
-    youth: ['청춘','대학교','고등학교','학원','성장','20대','10대','졸업','입시','동아리','친구','첫사랑','설레임','교복'],
-    action: ['액션','격투','전투','폭발','무기','군인','싸움','추격','총','칼','암살','폭력','스턴트'],
+  // 포맷 감지
+  const fmtHits = {}
+  for (const [fmt, signals] of Object.entries(FORMAT_SIGNALS)) {
+    fmtHits[fmt] = signals.filter(s => t.includes(s.toLowerCase())).length
   }
+  const detectedFormat = Object.entries(fmtHits).sort((a,b) => b[1]-a[1]).find(([,v]) => v > 0)?.[0] || 'ott_drama'
 
-  const scores = {}
-  for (const [genre, keywords] of Object.entries(genreSignals)) {
-    scores[genre] = keywords.filter(k => t.includes(k)).length
+  // 장르 감지
+  const genreScores = {}
+  for (const [g, kws] of Object.entries(GENRE_KW)) {
+    genreScores[g] = kws.filter(k => t.includes(k)).length
   }
+  const genreEntries = Object.entries(genreScores).sort((a,b) => b[1]-a[1])
+  const topGenre = genreEntries[0][0]
+  const topScore = genreEntries[0][1]
+  const activeGenres = genreEntries.filter(([,v]) => v > 0).length
 
-  const topGenre = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0]
-  const topScore = scores[topGenre]
-  const genreTotal = Object.values(scores).reduce((a, b) => a + b, 0)
-  const activeGenres = Object.entries(scores).filter(([, v]) => v > 0).length
+  // 서사 피처
+  const hasFastPace        = /반전|충격|급전|긴박|속도감|빠른 전개|숨막히/.test(t)
+  const hasSlowPace        = /잔잔|천천히|소소|차분|여운|느린/.test(t)
+  const hasNonLinear       = /플래시백|과거 회상|비선형|교차 편집|시간이 엇갈|역순/.test(t)
+  const hasCharacterFocus  = /캐릭터|인물|주인공|내면|심리|성장|관계|감정선/.test(t)
+  const hasEventFocus      = /사건|전투|추격|충돌|갈등|위기|반전|폭발|결전/.test(t)
+  const hasHappyEnding     = /해피엔딩|행복한 결말|함께|희망|극복|해결/.test(t)
+  const hasSadEnding       = /비극|슬픈 결말|죽음|이별로 끝|비운|상실/.test(t)
+  const hasOpenEnding      = /열린 결말|모호한|여운|여지를|불확실/.test(t)
+  const hasFemaleProtag    = /여주인공|여성 주인공|여성 서사|여성 중심/.test(t)
+  const hasOpeningHook     = /프롤로그|오프닝|첫 장면|갑자기|충격적인 시작|인트로/.test(t)
+  const hasConflict        = /갈등|대립|충돌|위기|대결|긴장 관계/.test(t)
+  const hasFamilyTheme     = /가족|부모|아버지|어머니|자녀|형제|가정/.test(t)
+  const hasWorkplace       = /직장|회사|병원|사무실|직업|커리어/.test(t)
 
-  const hasFastPace = ['반전','충격','급전','긴박','폭발적','속도'].some(k => t.includes(k))
-  const hasSlowPace = ['잔잔','천천히','성장','일상','소소','차분','여운'].some(k => t.includes(k))
-  const hasNonLinear = ['플래시백','과거','회상','시간이 엇갈','비선형','교차','서술'].some(k => t.includes(k))
-  const hasCharacterFocus = ['캐릭터','인물','주인공','성격','감정','내면','성장','관계','심리'].some(k => t.includes(k))
-  const hasEventFocus = ['사건','전투','추격','충돌','갈등','위기','해결','반전','폭발'].some(k => t.includes(k))
-  const hasHappyEnding = ['해피엔딩','행복','결말','함께','희망','사랑으로 끝'].some(k => t.includes(k))
-  const hasSadEnding = ['비극','슬픈 결말','죽음','이별','눈물','상실','비운'].some(k => t.includes(k))
-  const hasOpenEnding = ['열린 결말','모호','여운','미지','불확실','여지'].some(k => t.includes(k))
-  const hasFemaleProtagonist = ['여주인공','여성 주인공','그녀','여자 주인공','여성 서사'].some(k => t.includes(k))
+  const darkCnt  = (t.match(/어둠|비극|암울|절망|공포|살인|범죄|복수/g) || []).length
+  const lightCnt = (t.match(/따뜻|유쾌|웃음|행복|밝은|설렘|코미디/g) || []).length
+  const tone = darkCnt > lightCnt + 1 ? 'dark' : lightCnt > darkCnt + 1 ? 'light' : 'balanced'
 
-  // 장르 조합 독창성 (틈새 지수)
-  const nicheScore = Math.min(10, 3 + activeGenres * 1.2 + (topScore < 3 ? 2 : 0))
+  const nicheScore = Math.min(10, 2 + activeGenres * 1.2 + (topScore < 2 ? 2 : 0))
 
   return {
-    scores, topGenre, topScore, genreTotal, activeGenres,
-    hasFastPace, hasSlowPace, hasNonLinear, hasCharacterFocus,
-    hasEventFocus, hasHappyEnding, hasSadEnding, hasOpenEnding,
-    hasFemaleProtagonist, nicheScore,
+    text_lower: t, detectedFormat,
+    genreScores, topGenre, topScore, activeGenres,
+    hasFastPace, hasSlowPace, hasNonLinear,
+    hasCharacterFocus, hasEventFocus,
+    hasHappyEnding, hasSadEnding, hasOpenEnding,
+    hasFemaleProtag, hasOpeningHook, hasConflict,
+    hasFamilyTheme, hasWorkplace, tone, nicheScore,
   }
 }
 
-// ─── 페르소나별 점수 계산 ──────────────────────────────────────────────────────
-function scorePersona(persona, analysis, idx) {
+// ─── 페르소나별 점수 계산 ─────────────────────────────────────────────────────
+function stableHash(personaId, topGenre) {
+  const s = personaId + topGenre
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+  return Math.abs(h)
+}
+
+function getNicheIndex(cp) {
+  return { '탐색형':0.85, '분석형':0.60, '완주형':0.65, '정주행형':0.45, '클립형':0.35 }[cp] ?? 0.5
+}
+
+function scorePersona(persona, analysis) {
   const {
-    scores, topGenre, hasFastPace, hasSlowPace, hasNonLinear,
-    hasCharacterFocus, hasEventFocus, hasFemaleProtagonist,
-    hasHappyEnding, hasSadEnding, hasOpenEnding, nicheScore, activeGenres
+    genreScores, hasFastPace, hasSlowPace, hasNonLinear,
+    hasCharacterFocus, hasEventFocus, hasHappyEnding, hasSadEnding, hasOpenEnding,
+    hasFemaleProtag, hasOpeningHook, hasConflict, tone,
+    activeGenres, nicheScore, detectedFormat,
   } = analysis
 
-  // 페르소나마다 일관된 미세 변동 (같은 시나리오+페르소나 → 항상 동일)
-  const jitter = ((idx * 2654435761) % 100) / 100  // 0~0.99
+  const cp = persona.taste_ontology.consumption_pattern
+  const ew = persona.evaluation_weights
+  const gw = persona.taste_ontology.genre_weights
 
-  // A차원: 취향 공동체 적합도 — 장르 가중치 매칭
-  const genreMatchSum = Object.entries(scores)
-    .filter(([, cnt]) => cnt > 0)
-    .reduce((sum, [g, cnt]) => sum + (persona.genre_weights[g] || 5) * Math.min(cnt, 3), 0)
-  const genreMatchNorm = genreMatchSum / Math.max(1, Object.values(scores).filter(v => v > 0).length * 3)
-  const A = Math.min(10, Math.max(1, Math.round(genreMatchNorm * 1.0 + jitter * 0.8)))
+  const h = stableHash(persona.id, analysis.topGenre)
+  const jitter = (h % 60) / 100  // 0.00 ~ 0.59
 
-  // B차원: 서사 구조 선호도 — narrative_pref vs 시나리오 구조
-  let B = 5
-  if (persona.narrative_pref === 'linear') {
-    if (!hasNonLinear) B += 2
-    if (hasSlowPace) B += 1
-    if (hasFastPace && !hasEventFocus) B -= 1
-  } else if (persona.narrative_pref === 'nonlinear') {
-    if (hasNonLinear) B += 2
-    if (hasFastPace) B += 1
-    if (!hasNonLinear && hasSlowPace) B -= 1
-  } else { // episodic
-    if (hasCharacterFocus) B += 1
-    if (hasFastPace) B += 1
-  }
-  if (hasEventFocus && persona.frbr.includes('event')) B += 1
-  B = Math.min(10, Math.max(1, B + Math.round(jitter * 1.5)))
+  // ── A: 취향 적합도 ──────────────────────────────────────────────────────────
+  const activeWeights = Object.entries(genreScores)
+    .filter(([,c]) => c > 0).map(([g]) => gw[g] ?? 5)
+  const rawA_base = activeWeights.length
+    ? activeWeights.reduce((s,w) => s + w, 0) / activeWeights.length : 5
+  const antiPenalty = calcAntiTagPenalty(persona, analysis)
+  const rawA = Math.max(1, rawA_base - antiPenalty * 0.7)
 
-  // C차원: FRBR 요소 민감도
-  let C = 4
-  if (persona.frbr.includes('character') && hasCharacterFocus) C += 3
-  if (persona.frbr.includes('event') && hasEventFocus) C += 3
-  if (persona.frbr.includes('emotion')) {
-    if (hasHappyEnding || hasSadEnding) C += 2
-    if (hasCharacterFocus) C += 1
-  }
-  if (persona.frbr.includes('concept') && activeGenres >= 2) C += 2
-  if (persona.frbr.includes('context') && analysis.scores.social > 0) C += 2
-  if (hasFemaleProtagonist && persona.genre_tags.some(t => ['워맨스','커리어','성장','여성서사'].includes(t))) C += 1
-  C = Math.min(10, Math.max(1, C + Math.round(jitter * 1.2)))
-
-  // D차원: 몰입도 예측
-  let D = 5
-  if (A >= 7) D += 2
-  else if (A <= 3) D -= 2
-  if (persona.engagement_type === '완주형') {
-    if (hasSlowPace) D += 1
-    if (B >= 7) D += 1
-  } else if (persona.engagement_type === '클립형') {
-    if (hasFastPace) D += 2
-    if (hasSlowPace) D -= 2
-    if (hasCharacterFocus) D += 1
+  // ── B: 서사 구조 ────────────────────────────────────────────────────────────
+  let rawB = 5
+  if (cp === '클립형') {
+    if (hasFastPace)   rawB += 2
+    if (hasSlowPace)   rawB -= 2
+    if (!hasConflict)  rawB -= 1
+  } else if (cp === '탐색형') {
+    if (hasNonLinear)                        rawB += 2
+    if (!hasHappyEnding && !hasOpenEnding)   rawB += 1
+    if (hasCharacterFocus)                   rawB += 1
+  } else if (cp === '분석형') {
+    if (hasEventFocus)  rawB += 2
+    if (hasConflict)    rawB += 1
+    if (hasNonLinear)   rawB -= 1
+  } else if (cp === '완주형') {
+    if (hasConflict)                      rawB += 1
+    if (hasNonLinear)                     rawB += 1
+    if (hasHappyEnding || hasSadEnding)   rawB += 1
   } else { // 정주행형
-    if (A >= 7) D += 1
-    if (hasHappyEnding) D += 1
+    if (!hasNonLinear)      rawB += 1
+    if (hasCharacterFocus)  rawB += 1
+    if (hasHappyEnding)     rawB += 1
   }
-  D = Math.min(10, Math.max(1, D + Math.round(jitter * 1.2)))
+  rawB = Math.max(1, Math.min(10, rawB + (ew.narrative_structure - 0.20) * 10 * 0.5))
 
-  // E차원: 틈새 취향 지수
-  const E = Math.min(10, Math.max(1, Math.round(
-    persona.niche_index * 6 + nicheScore * 0.4 + jitter * 0.8
-  )))
+  // ── C: FRBR 감도 ────────────────────────────────────────────────────────────
+  let rawC = 4
+  if (hasCharacterFocus)                           rawC += ew.character_empathy * 12
+  if (hasFemaleProtag && ew.character_empathy >= 0.25) rawC += 0.8
+  if (hasEventFocus)                               rawC += ew.narrative_structure * 10
+  if (hasHappyEnding || hasSadEnding)              rawC += ew.ending_satisfaction * 15
+  if (genreScores.social > 0)                      rawC += 0.5
+  rawC = Math.min(10, rawC)
 
-  return { A, B, C, D, E }
+  // ── D: 몰입도/후킹 ──────────────────────────────────────────────────────────
+  let rawD = 5
+  rawD += hasOpeningHook ? 2 : -0.5
+  if (cp === '클립형') {
+    if (hasFastPace)   rawD += 2
+    if (hasSlowPace)   rawD -= 3
+    if (genreScores.romance > 0 || genreScores.thriller > 0) rawD += 1
+  } else if (cp === '완주형') {
+    if (hasSadEnding || hasNonLinear) rawD += 1
+    if (hasConflict)                  rawD += 1
+  } else if (cp === '정주행형') {
+    if (hasCharacterFocus)               rawD += 1.5
+    if (hasHappyEnding)                  rawD += 1
+    if (hasFamilyTheme || hasWorkplace)  rawD += 0.5
+  } else if (cp === '탐색형') {
+    if (hasNonLinear)   rawD += 2
+    if (hasOpenEnding)  rawD += 1.5
+    if (tone === 'dark') rawD += 0.5
+  } else { // 분석형
+    if (hasConflict)    rawD += 1
+    if (genreScores.thriller > 0 || genreScores.social > 0) rawD += 1
+    if (hasFastPace)    rawD += 0.5
+  }
+  rawD += rawA >= 7 ? 1 : rawA <= 3 ? -1 : 0
+  rawD = Math.max(1, Math.min(10, rawD + (ew.pacing - 0.15) * 15 * 0.4))
+
+  // ── E: 틈새 지수 ────────────────────────────────────────────────────────────
+  const rawE = Math.min(10, getNicheIndex(cp) * 6 + nicheScore * 0.4)
+
+  // ── Format sensitivity 보정 (A~D, E 제외) ────────────────────────────────────
+  const fs = persona.sensitivity_profile.format_sensitivity[detectedFormat] ?? 0.7
+  const withFS = r => Math.max(1, Math.min(10, 5 + (r - 5) * fs))
+
+  return {
+    A: Math.min(10, Math.max(1, Math.round(withFS(rawA) + jitter))),
+    B: Math.min(10, Math.max(1, Math.round(withFS(rawB) + jitter * 0.6))),
+    C: Math.min(10, Math.max(1, Math.round(withFS(rawC) + jitter * 0.4))),
+    D: Math.min(10, Math.max(1, Math.round(withFS(rawD) + jitter * 0.7))),
+    E: Math.min(10, Math.max(1, Math.round(rawE + jitter * 0.5))),
+  }
 }
 
-// ─── 페르소나별 리뷰 생성 ─────────────────────────────────────────────────────
+// ─── 리뷰 생성 ───────────────────────────────────────────────────────────────
 function generateReview(persona, scores, analysis) {
-  const { topGenre, hasCharacterFocus, hasEventFocus, hasNonLinear,
-    hasFastPace, hasSlowPace, hasHappyEnding, hasSadEnding, hasOpenEnding,
-    hasFemaleProtagonist } = analysis
+  const { topGenre, hasFastPace, hasSlowPace, hasNonLinear,
+    hasCharacterFocus, hasOpenEnding, hasFemaleProtag, detectedFormat, tone } = analysis
 
-  const genreKo = {
-    romance:'로맨스', healing:'힐링', thriller:'범죄·스릴러', horror:'공포·오컬트',
-    sf:'SF·판타지', historical:'사극·역사', social:'사회비평', youth:'청춘물', action:'액션',
-  }
-  const topKo = genreKo[topGenre] || '이 장르'
+  const cp   = persona.taste_ontology.consumption_pattern
+  const tc   = persona.taste_ontology.taste_community
+  const topKo = GENRE_KO[topGenre] || '이 장르'
+  const fmtKo = FORMAT_KO[detectedFormat] || 'OTT 드라마'
+  const firedTags = persona.taste_ontology.anti_tags.filter(tag => {
+    const fn = ANTI_TAG_DETECTORS[tag]; return fn ? fn(analysis.text_lower) : false
+  })
 
   const reasons = {
     A: scores.A >= 8
-      ? `취향 공동체(${persona.taste_community})와 ${topKo} 장르가 높은 정합성을 보입니다.`
+      ? `[${tc}] 취향과 ${topKo} 시나리오가 높은 정합성을 보입니다.`
       : scores.A >= 5
-      ? `${topKo}는 제 취향과 부분적으로 겹치지만, 완전히 제 스타일은 아닙니다.`
-      : `주로 ${persona.genre_tags[0]}를 즐기는 입장에서 ${topKo} 시나리오는 취향과 거리가 있습니다.`,
+        ? firedTags.length
+          ? `${topKo}는 관심 범위지만 "${firedTags[0]}" 요소로 감점. 취향과 일부 상충.`
+          : `${topKo}는 관심 범위이나 핵심 선호(${persona.taste_ontology.genre_tags[0]})와 완전 일치하지 않음.`
+        : firedTags.length
+          ? `"${firedTags.slice(0,2).join('", "')}" 요소 감지. 취향 범위 밖의 시나리오.`
+          : `${persona.taste_ontology.genre_tags[0]} 선호자로서 ${topKo} 시나리오는 취향과 거리가 있음.`,
 
     B: scores.B >= 8
-      ? `${hasNonLinear ? '비선형 구성이 신선하게' : '안정적인 선형 구조가'} 서사 흐름을 자연스럽게 만듭니다.`
+      ? `${hasNonLinear ? '비선형 구성이 신선하게' : '안정적인 구조가'} ${cp} 소비 패턴에 최적화됨.`
       : scores.B >= 5
-      ? `서사 구조는 무난하지만 ${hasFastPace ? '전개가 지나치게 빨라 감정 소화가 어렵습니다.' : '후반부 완급 조절이 아쉽습니다.'}`
-      : `${persona.narrative_pref === 'nonlinear' ? '너무 단조로운 구조라' : '산만한 구성 탓에'} 집중하기 힘들었습니다.`,
+        ? hasFastPace && cp === '클립형'
+          ? '빠른 전개로 초반 집중도는 좋으나 후반 감정 소화 여지 필요.'
+          : hasSlowPace
+            ? '잔잔한 페이스는 정서적으로 좋으나 긴장감 유지 보완 필요.'
+            : '서사 구조는 무난하지만 특별한 강점이 보이지 않음.'
+        : cp === '클립형'
+          ? '전개가 너무 느려 클립형 소비에 맞지 않음.'
+          : cp === '탐색형'
+            ? '너무 공식적인 구조라 실험적 서사를 찾는 입장에서 아쉬움.'
+            : '서사 구조가 소비 패턴과 맞지 않아 집중도 유지 어려움.',
 
     C: scores.C >= 8
-      ? `${hasCharacterFocus ? '인물 묘사가 입체적이고' : '사건의 밀도가 높아'} 핵심 서사 요소에서 강하게 반응했습니다.`
+      ? hasCharacterFocus
+        ? `인물 내면 묘사가 입체적. "${tc}" 취향에서 핵심 서사 요소에 강하게 반응.`
+        : '사건 밀도와 감정 씬이 충분해 서사 요소 민감도 충족.'
       : scores.C >= 5
-      ? `${hasCharacterFocus ? '캐릭터는 매력적이나 심리 묘사가 더 깊어지면 좋겠습니다.' : '사건은 흥미롭지만 인물의 내면이 얕습니다.'}`
-      : `제가 중시하는 ${persona.frbr.includes('character') ? '캐릭터 깊이' : '서사 맥락'}이 부족합니다.`,
+        ? '캐릭터는 매력적이나 심리 묘사가 더 깊어지면 좋겠음.'
+        : '핵심 서사 요소가 부족하거나 이 시청자의 감수성과 맞지 않음.',
 
     D: scores.D >= 8
-      ? `${persona.engagement_type === '클립형' ? '핵심 장면들이 강렬해 계속 보게 됩니다.' : '처음부터 끝까지 집중하게 만드는 흡입력이 있습니다.'}`
+      ? cp === '클립형'
+        ? '핵심 장면이 강렬해 계속 찾아보게 되는 구조.'
+        : cp === '탐색형'
+          ? '독특한 서사 흐름이 새로운 탐색 의욕을 자극.'
+          : cp === '분석형'
+            ? `${fmtKo} 편성 기준 화제성과 흡입력 모두 유망.`
+            : '처음부터 끝까지 집중을 유지하는 흡입력 있음.'
       : scores.D >= 5
-      ? `${persona.engagement_type === '클립형' ? '하이라이트는 있지만 전체를 끝까지 볼 것 같진 않습니다.' : '완주하겠지만 재시청하고 싶은 작품은 아닙니다.'}`
-      : `${hasSlowPace && persona.engagement_type === '클립형' ? '페이스가 너무 느려 중간에 포기할 것 같습니다.' : '몰입이 자꾸 끊겨 끝까지 볼 자신이 없습니다.'}`,
+        ? cp === '클립형'
+          ? '하이라이트는 있지만 전체를 끝까지 볼 것 같지는 않음.'
+          : '완주하겠지만 재시청이나 적극 추천 의욕은 낮음.'
+        : cp === '클립형'
+          ? '첫 장면부터 집중을 끌지 못함. 이탈 가능성 높음.'
+          : '몰입이 끊겨 끝까지 볼 동기가 부족함.',
 
     E: scores.E >= 8
-      ? `${analysis.activeGenres >= 3 ? '복합 장르 조합이' : '독특한 소재가'} 틈새 팬덤에게 강하게 어필할 것입니다.`
+      ? `장르 조합의 독창성이 "${tc}" 팬덤에서 강한 바이럴 반응을 이끌 것.`
       : scores.E >= 5
-      ? `대중적 장르 구성으로 폭넓은 시청자를 확보할 수 있지만 팬덤 결집력은 약할 수 있습니다.`
-      : `장르 정체성이 불명확해 타겟 관객층 설정이 어렵습니다.`,
+        ? '대중적 장르 구성으로 접근성 폭넓음. 팬덤 결집력은 중간 수준.'
+        : '장르 정체성이 불명확해 틈새 팬덤 코드 부재.',
   }
 
-  // 한줄평 생성
   const avg = (scores.A + scores.B + scores.C + scores.D + scores.E) / 5
-  let comment = ''
-  if (avg >= 8) comment = `${topKo} 팬으로서 적극 추천합니다. ${hasHappyEnding ? '결말도 만족스럽습니다.' : ''}`
-  else if (avg >= 7) comment = `전반적으로 좋았습니다. ${scores.B >= 7 ? '서사 구조가 특히 탄탄합니다.' : '몇 가지 보완하면 더 좋을 것 같습니다.'}`
-  else if (avg >= 5) {
-    if (persona.engagement_type === '클립형') comment = `일부 장면은 인상적이지만 전체를 다 보진 않을 것 같아요.`
-    else comment = `제 취향과 완전히 맞지는 않지만 완주는 하겠습니다.`
-  } else {
-    comment = `솔직히 ${persona.genre_tags[0]} 팬인 제게는 ${topKo} 시나리오는 취향이 아닙니다.`
+  let comment =
+    avg >= 8
+      ? cp === '클립형'   ? `${topKo} 팬으로서 이 시나리오 계속 찾아볼 것 같아요.`
+      : cp === '탐색형'   ? '실험적 서사 안에서 이 작품만의 색깔이 보입니다. 주목할 만합니다.'
+      : cp === '분석형'   ? `${fmtKo} 기준 상업성과 화제성 모두 유망. 편성 가치 있음.`
+                          : `${topKo} 좋아하는 입장에서 적극 추천하겠습니다.`
+      : avg >= 6.5
+      ? cp === '클립형'   ? '일부 장면은 인상적. 클립으로 공유는 할 것 같아요.'
+                          : '전반적으로 괜찮습니다. 몇 가지 보완하면 훨씬 좋아질 것 같아요.'
+      : avg >= 5
+      ? firedTags.length  ? `관심은 가지만 "${firedTags[0]}" 요소 때문에 선뜻 추천하기 어렵네요.`
+                          : '취향과 완전히 맞지는 않지만 나름의 매력은 있습니다.'
+                          : `솔직히 제 취향과는 거리가 멀어요. ${persona.taste_ontology.genre_tags[0]} 팬에게는 권하기 어렵겠습니다.`
+
+  if (hasFemaleProtag && (tc.includes('여성') || persona.taste_ontology.genre_tags.some(t => ['성장','커리어','워맨스'].includes(t)))) {
+    comment += ' 여성 주인공 서사가 반갑습니다.'
   }
-  if (hasFemaleProtagonist && persona.genre_tags.some(t => ['워맨스','성장','커리어'].includes(t))) {
-    comment += ' 여성 주인공의 서사가 반갑습니다.'
-  }
-  if (hasOpenEnding) comment += ' 열린 결말은 여운은 있지만 호불호가 갈릴 것 같습니다.'
+  if (hasOpenEnding) comment += ' 열린 결말은 여운 있지만 호불호가 갈릴 것 같습니다.'
 
   return { reasons, comment: comment.trim() }
 }
 
-// ─── 충돌 페어 감지 ───────────────────────────────────────────────────────────
-function detectConflicts(personaResults) {
-  const conflicts = []
-  const dimLabel = { A:'취향 공동체 적합도', B:'서사 구조', C:'FRBR 서사 요소', D:'몰입도', E:'틈새 취향 지수' }
-  for (let i = 0; i < personaResults.length; i++) {
-    for (let j = i + 1; j < personaResults.length; j++) {
+// ─── 충돌 페어 감지 (gap ≥ 3, CLAUDE.md §5-5) ────────────────────────────────
+function detectConflicts(results) {
+  const pairs = []
+  const dimLabel = { A:'취향 공동체 적합도', B:'서사 구조', C:'FRBR 서사 요소', D:'몰입도', E:'틈새 지수' }
+  for (let i = 0; i < results.length; i++) {
+    for (let j = i + 1; j < results.length; j++) {
       for (const dim of ['A','B','C','D','E']) {
-        const gap = Math.abs(personaResults[i].scores[dim] - personaResults[j].scores[dim])
-        if (gap >= 4) {
-          const pa = personaResults[i], pb = personaResults[j]
-          const hi = pa.scores[dim] > pb.scores[dim] ? pa : pb
-          const lo = pa.scores[dim] > pb.scores[dim] ? pb : pa
-          conflicts.push({
-            persona_a: pa.persona_id, persona_b: pb.persona_id,
-            dimension: dim, score_gap: gap,
-            debate_summary: `${hi.name}(${hi.scores[dim]}점, ${hi.taste_community})은 "${dimLabel[dim]} 측면에서 충분히 만족"하지만, ${lo.name}(${lo.scores[dim]}점, ${lo.taste_community})은 "${lo.genre_tags[0]} 선호 기준으로 기대에 못 미쳤다"고 반박합니다.`,
+        const gap = Math.abs(results[i].scores[dim] - results[j].scores[dim])
+        if (gap >= 3) {
+          const hi = results[i].scores[dim] > results[j].scores[dim] ? results[i] : results[j]
+          const lo = results[i].scores[dim] > results[j].scores[dim] ? results[j] : results[i]
+          pairs.push({
+            persona_a: results[i].persona_id,
+            persona_b: results[j].persona_id,
+            dimension: dim,
+            score_gap: gap,
+            debate_summary: `${hi.name}(${hi.scores[dim]}점, ${hi.taste_community})은 "${dimLabel[dim]} 측면에서 충분히 만족"하지만, ${lo.name}(${lo.scores[dim]}점, ${lo.taste_community})은 "${lo.genre_tags?.[0] ?? '해당'} 선호 기준으로 기대에 못 미쳤다"고 반박합니다.`,
           })
         }
       }
     }
   }
-  return conflicts.sort((a, b) => b.score_gap - a.score_gap).slice(0, 4)
+  return pairs.sort((a,b) => b.score_gap - a.score_gap).slice(0, 5)
 }
 
-// ─── 이탈 위험 씬 ─────────────────────────────────────────────────────────────
-function generateDropoutScenes(analysis, personaResults) {
+// ─── 이탈 위험 씬 ────────────────────────────────────────────────────────────
+function generateDropoutScenes(analysis, results) {
   const scenes = []
-  const clipPersonas = personaResults.filter(p => p.engagement_type === '클립형')
-  const avgClipD = clipPersonas.length
-    ? clipPersonas.reduce((s, p) => s + p.scores.D, 0) / clipPersonas.length : 7
-  const lowAPersonas = personaResults.filter(p => p.scores.A <= 4)
+  const clipFans = results.filter(r => r.engagement_type === '클립형')
+  const avgClipD = clipFans.length
+    ? clipFans.reduce((s,r) => s + r.scores.D, 0) / clipFans.length : 7
+  const lowA = results.filter(r => r.scores.A <= 4)
 
   if (analysis.hasSlowPace || avgClipD < 6) {
+    const fmtD = (FORMAT_DIM_WEIGHTS[analysis.detectedFormat]?.D ?? 0.2) * 100
     scenes.push({
       scene_id: 4,
       risk: parseFloat(Math.min(0.92, 0.5 + (6 - Math.min(6, avgClipD)) * 0.07).toFixed(2)),
-      reason: `잔잔한 전개 구간: 클립형 페르소나(${clipPersonas.slice(0,2).map(p=>p.name).join(', ')})의 이탈 위험. KCA(2023) 연구에서 클립형 소비는 짧은 호흡 선호를 보임.`,
+      reason: `잔잔한 전개 구간: 클립형 페르소나(${clipFans.slice(0,2).map(p=>p.name).join(', ')})의 이탈 위험. ${FORMAT_KO[analysis.detectedFormat]} D차원 가중치(${fmtD.toFixed(0)}%) 미충족.`,
     })
   }
-  if (lowAPersonas.length >= 2) {
+  if (lowA.length >= 3) {
     scenes.push({
       scene_id: 7,
-      risk: parseFloat(Math.min(0.88, 0.45 + lowAPersonas.length * 0.05).toFixed(2)),
-      reason: `장르 취향 불일치: ${lowAPersonas.slice(0,2).map(p=>p.name).join(', ')} 등 ${lowAPersonas.length}명이 중반부 이탈 위험. 취향 공동체 정합성 낮음.`,
+      risk: parseFloat(Math.min(0.88, 0.4 + lowA.length * 0.04).toFixed(2)),
+      reason: `장르 취향 불일치: ${lowA.slice(0,3).map(p=>p.name).join(', ')} 등 ${lowA.length}명 중반부 이탈 위험.`,
     })
   }
   if (analysis.hasOpenEnding) {
     scenes.push({
       scene_id: 10,
-      risk: 0.55,
-      reason: '열린 결말 구간: 완결성을 중시하는 정주행형 페르소나의 이탈 또는 불만족 위험.',
+      risk: 0.52,
+      reason: '열린 결말: 정주행형·완주형 페르소나의 카타르시스 미달 가능성. 재시청 의욕 저하 위험.',
     })
   }
   if (scenes.length === 0) {
-    scenes.push({ scene_id: 5, risk: 0.38, reason: '전반적 이탈 위험 낮음. 장르 불호 페르소나의 중반 집중도 저하 가능성.' })
+    scenes.push({ scene_id: 5, risk: 0.35, reason: '전반적 이탈 위험 낮음. 장르 불호 페르소나의 중반 집중도 저하 가능성만 존재.' })
   }
   return scenes
 }
 
 // ─── 도플갱어 추천 ────────────────────────────────────────────────────────────
-const DOPPELGANGER_MAP = {
-  romance:['나의 아저씨','동백꽃 필 무렵','스물다섯 스물하나','내 남편과 결혼해줘','눈물의 여왕'],
-  healing:['응답하라 1988','슬기로운 의사생활','나의 해방일지','우리들의 블루스'],
-  thriller:['시그널','비밀의 숲','악의 꽃','마이 네임','더 글로리'],
-  horror:['경이로운 소문','스위트홈','무빙','악귀'],
-  sf:['고요의 바다','승리호','외계+인','무빙'],
-  historical:['킹덤','육룡이 나르샤','미스터 션샤인','정년이'],
-  social:['기생충','오징어 게임','D.P.','수리남','이태원 클라쓰'],
-  youth:['스물다섯 스물하나','청춘기록','이태원 클라쓰','열여덟의 순간'],
-  action:['모범택시','빈센조','무빙','조선 로맨스 스캔들'],
+const DOPPELGANGERS = {
+  romance:   ['나의 아저씨','동백꽃 필 무렵','눈물의 여왕','내 남편과 결혼해줘','스물다섯 스물하나'],
+  healing:   ['응답하라 1988','슬기로운 의사생활','나의 해방일지','우리들의 블루스'],
+  thriller:  ['시그널','비밀의 숲','악의 꽃','마이 네임','더 글로리'],
+  horror:    ['경이로운 소문','스위트홈','무빙','악귀','파묘'],
+  sf:        ['고요의 바다','무빙','외계+인','승리호','지금 우리 학교는'],
+  historical:['킹덤','미스터 션샤인','정년이','육룡이 나르샤','연모'],
+  social:    ['오징어 게임','기생충','D.P.','이태원 클라쓰','수리남'],
+  youth:     ['스물다섯 스물하나','청춘기록','열여덟의 순간','약한영웅'],
+  action:    ['모범택시','빈센조','무빙','조선 로맨스 스캔들'],
 }
 
 function getDoppelgangers(analysis) {
-  const top = Object.entries(analysis.scores).sort((a,b) => b[1]-a[1]).slice(0,2).map(([g])=>g)
-  return [...new Set(top.flatMap(g => DOPPELGANGER_MAP[g]||[]))].slice(0,4)
+  const top = Object.entries(analysis.genreScores).sort((a,b) => b[1]-a[1]).slice(0,2).map(([g])=>g)
+  return [...new Set(top.flatMap(g => DOPPELGANGERS[g] || []))].slice(0, 4)
 }
 
 // ─── 메인 핸들러 ──────────────────────────────────────────────────────────────
@@ -506,34 +421,48 @@ export default async function handler(req, res) {
   if (!scenario || scenario.trim().length < 10) return res.status(400).json({ error: '시나리오가 너무 짧습니다.' })
 
   const analysis = analyzeScenario(scenario)
+  const dimWeights = FORMAT_DIM_WEIGHTS[analysis.detectedFormat]
 
-  const personaResults = PERSONAS.map((persona, idx) => {
-    const scores = scorePersona(persona, analysis, idx)
+  const personaResults = PERSONAS.map(persona => {
+    const scores = scorePersona(persona, analysis)
     const { reasons, comment } = generateReview(persona, scores, analysis)
-    return { ...persona, scores, score_reasons: reasons, comment }
+    return {
+      persona_id:      persona.id,
+      name:            persona.name,
+      age:             persona.demographics.age,
+      gender:          persona.demographics.gender,
+      occupation:      persona.demographics.occupation,
+      region:          persona.demographics.region,
+      taste_community: persona.taste_ontology.taste_community,
+      engagement_type: persona.taste_ontology.consumption_pattern,
+      genre_tags:      persona.taste_ontology.genre_tags,
+      scores, score_reasons: reasons, comment,
+    }
   })
 
   const dims = ['A','B','C','D','E']
   const dimension_averages = {}
   for (const d of dims) {
     dimension_averages[d] = parseFloat(
-      (personaResults.reduce((s, p) => s + p.scores[d], 0) / personaResults.length).toFixed(1)
+      (personaResults.reduce((s,p) => s + p.scores[d], 0) / personaResults.length).toFixed(1)
     )
   }
 
-  const overallAvg = Object.values(dimension_averages).reduce((a,b)=>a+b,0)/5
-  const overall_grade = overallAvg >= 7.5 ? 'GO' : overallAvg >= 5.0 ? 'CAUTION' : 'PASS'
-
-  const cleanPersonas = personaResults.map(({ data_basis: _d, genre_weights: _gw, narrative_pref: _np, frbr: _f, niche_index: _ni, ...rest }) => rest)
+  // 포맷별 차원 가중 종합 점수
+  const weightedScore = dims.reduce((s, d) => s + dimension_averages[d] * (dimWeights[d] ?? 0.2), 0)
+  const overall_grade = weightedScore >= 7.5 ? 'GO' : weightedScore >= 5.0 ? 'CAUTION' : 'PASS'
 
   return res.status(200).json({
-    scenario_title: scenario.slice(0, 30).trim() + (scenario.length > 30 ? '...' : ''),
-    evaluation_timestamp: new Date().toISOString(),
+    scenario_title:               scenario.slice(0, 30).trim() + (scenario.length > 30 ? '...' : ''),
+    evaluation_timestamp:         new Date().toISOString(),
+    detected_format:              analysis.detectedFormat,
+    detected_format_label:        FORMAT_KO[analysis.detectedFormat],
     overall_grade,
+    weighted_score:               parseFloat(weightedScore.toFixed(2)),
     dimension_averages,
-    persona_scores: cleanPersonas,
-    conflict_pairs: detectConflicts(personaResults),
-    dropout_risk_scenes: generateDropoutScenes(analysis, personaResults),
+    persona_scores:               personaResults,
+    conflict_pairs:               detectConflicts(personaResults),
+    dropout_risk_scenes:          generateDropoutScenes(analysis, personaResults),
     doppelganger_recommendations: getDoppelgangers(analysis),
     data_sources: [
       'KCA 미디어이슈&트렌드 vol.61 (2023) — SVOD 장르별 이용시간',
