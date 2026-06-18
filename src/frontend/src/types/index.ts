@@ -1,29 +1,21 @@
 export type Grade = 'GO' | 'CAUTION' | 'PASS'
 
-export interface Persona {
-  id: string
-  name: string
-  age: number
-  gender: string
-  occupation: string
-  region: string
-  raw_profile: string
-}
-
-export interface AudiencePersona {
-  id: string
-  name: string
-  taste_community: string
-  narrative_preference: string
-  frbr_sensitivity: string[]
-  engagement_type: string
-  niche_index: number
-  genre_tags: string[]
-  kofic_alignment: Record<string, number>
-  doppelganger_works: string[]
-}
-
 export type DimensionScores = Record<string, number>
+
+export interface PersonaScore {
+  persona_id: string
+  name: string
+  age?: number
+  gender?: string
+  occupation?: string
+  region?: string
+  taste_community?: string
+  engagement_type?: string
+  genre_tags?: string[]
+  scores: DimensionScores
+  score_reasons?: Record<string, string>
+  comment?: string
+}
 
 export interface ConflictPair {
   persona_a: string
@@ -44,10 +36,12 @@ export interface EvaluationResult {
   evaluation_timestamp: string
   overall_grade: Grade
   dimension_averages: DimensionScores
-  persona_scores: Array<{ persona_id: string; scores: DimensionScores }>
+  persona_scores: PersonaScore[]
   conflict_pairs: ConflictPair[]
   dropout_risk_scenes: DropoutScene[]
   doppelganger_recommendations: string[]
+  data_sources?: string[]
+  _mock?: boolean
 }
 
 export interface Message {
